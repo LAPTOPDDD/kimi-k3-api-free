@@ -1,0 +1,2 @@
+pip install -r requirements.txt
+streamlit run lgbm_pp_approximator_V1.py
