@@ -365,10 +365,21 @@ if has_edge:
         line=dict(color="#2ca02c", width=2, dash="dot"),
         marker=dict(size=5),
     ))
-    fig.add_vline(
-        x=dataset["edge_time"].iloc[0], line_dash="dot", line_color="#2ca02c",
-        annotation_text="край: дальше учитель недоступен",
-        annotation_position="top left",
+    # NB: add_vline с аннотацией несовместим с pandas.Timestamp (plotly считает
+    # среднее от Timestamp для позиции подписи) -> рисуем shape + annotation.
+    edge_start = dataset["edge_time"].iloc[0]
+    fig.add_shape(
+        type="line",
+        x0=edge_start, x1=edge_start,
+        y0=0, y1=1, yref="paper",
+        line=dict(dash="dot", color="#2ca02c"),
+    )
+    fig.add_annotation(
+        x=edge_start, y=1, yref="paper",
+        text="край: дальше учитель недоступен",
+        showarrow=False,
+        xanchor="left", yanchor="bottom",
+        font=dict(color="#2ca02c"),
     )
 fig.add_hline(y=0, line_dash="dot", line_color="gray")
 fig.update_layout(
