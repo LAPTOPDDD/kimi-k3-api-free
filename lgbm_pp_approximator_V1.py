@@ -4,10 +4,22 @@
 
 Исследовательский инструмент (НЕ торговый бот):
 LightGBM НЕ прогнозирует цену, а учится аппроксимировать производный сигнал:
-    ПП = первая производная Close после каузальной гауссовой фильтрации.
+    ПП = первая производная Close после гауссовой фильтрации.
 
-Защита от look-ahead bias:
-  * гауссов фильтр — ОДНОСТОРОННИЙ (только текущий и прошлые бары);
+Два режима учителя (целевой ПП):
+  * каузальный   — односторонний гауссов фильтр (только текущий и прошлые бары);
+  * неказуальный — симметричный гауссов фильтр (использует и БУДУЩИЕ бары).
+                   Это «идеальный» учитель: в реальном времени он недоступен,
+                   но модель на лаговых признаках учится восстанавливать его
+                   из прошлых данных.
+
+Ключевой эффект неказуального учителя — «край» истории:
+  на последних window//2 барах истинная неказуальная ПП ещё не вычислима
+  (нужны будущие бары), но обученная модель получает на вход каузальные
+  фичи из прошлого и выдаёт оценку «идеальной» ПП в реальном времени —
+  именно так она и обучалась. Эти бары показаны на графике отдельно.
+
+Защита от look-ahead bias (в обоих режимах):
   * признаки — только лаги (lag >= 1) Close / Returns / Volatility;
   * нормализация ПП — по статистикам ТОЛЬКО обучающего сегмента;
   * строгий временной сплит: train (1000 баров) -> test (150 баров сразу после).
@@ -99,17 +111,48 @@ def causal_gaussian_smooth(values: np.ndarray, sigma: float, window: int) -> np.
     return smoothed
 
 
-@st.cache_data(show_spinner=False)
-def build_dataset(df, max_lag, vol_window, gauss_sigma, gauss_window, norm_mode):
-    """Строит признаки/цель на всей истории (всё каузально), затем режет по времени.
+def noncausal_gaussian_smooth(values: np.ndarray, sigma: float, window: int) -> np.ndarray:
+    """Неказуальная (симметричная) гауссова фильтрация — «идеальный» учитель.
 
-    Возвращает dict с train/test или None, если истории не хватает.
+    Ядро центрировано на текущем баре: используются и ПРОШЛЫЕ, и БУДУЩИЕ бары.
+    Такой сигнал недоступен в реальном времени, но может служить учителем:
+    модель на лаговых признаках учится восстанавливать «идеальную» ПП.
+    Первые и последние half = window // 2 значений -> NaN (нет полного контекста).
+    """
+    half = window // 2
+    k = np.arange(-half, half + 1)  # симметричное ядро нечётной длины
+    kernel = np.exp(-0.5 * (k / sigma) ** 2)
+    kernel /= kernel.sum()
+    # smoothed[t] = sum_k kernel[k] * values[t+k]  (есть заглядывание вперёд)
+    smoothed = np.convolve(values, kernel, mode="same")
+    if half > 0:
+        smoothed[:half] = np.nan
+        smoothed[-half:] = np.nan
+    return smoothed
+
+
+@st.cache_data(show_spinner=False)
+def build_dataset(df, max_lag, vol_window, gauss_sigma, gauss_window, norm_mode, teacher_mode):
+    """Строит признаки/цель на всей истории, затем режет по времени.
+
+    Признаки — всегда каузальные (только лаги). Цель (учитель) — каузальная
+    или неказуальная ПП в зависимости от teacher_mode.
+
+    Дополнительно возвращает «край» истории (X_edge / edge_time): бары, где
+    признаки валидны, но учитель недоступен (только неказуальный режим —
+    последние gauss_window//2 баров). Именно здесь обученная модель выдаёт
+    оценку «идеальной» ПП по каузальным признакам в реальном времени.
+
+    Возвращает dict с train/test/edge или None, если истории не хватает.
     """
     close = df["close"].astype(float)
     returns = close.pct_change()
     volatility = returns.rolling(vol_window).std()
 
-    smoothed = causal_gaussian_smooth(close.to_numpy(), gauss_sigma, gauss_window)
+    if teacher_mode == "неказуальный":
+        smoothed = noncausal_gaussian_smooth(close.to_numpy(), gauss_sigma, gauss_window)
+    else:
+        smoothed = causal_gaussian_smooth(close.to_numpy(), gauss_sigma, gauss_window)
     target_raw = pd.Series(smoothed, index=df.index).diff()  # первая производная ПП
 
     feats = {}
@@ -118,8 +161,14 @@ def build_dataset(df, max_lag, vol_window, gauss_sigma, gauss_window, norm_mode)
         feats[f"ret_lag{lag}"] = returns.shift(lag)
         feats[f"vol_lag{lag}"] = volatility.shift(lag)
     X = pd.DataFrame(feats, index=df.index)
+    feature_cols = list(X.columns)
 
     full = pd.concat([df["time"], X, target_raw.rename("target")], axis=1)
+
+    # «край» истории: признаки валидны, но учитель NaN (неказуальный режим —
+    # последние gauss_window//2 баров; в каузальном режиме таких баров нет).
+    edge = full[full["target"].isna() & full[feature_cols].notna().all(axis=1)]
+
     full = full.dropna().reset_index(drop=True)
 
     if len(full) < N_TRAIN + N_TEST:
@@ -141,7 +190,6 @@ def build_dataset(df, max_lag, vol_window, gauss_sigma, gauss_window, norm_mode)
     else:
         full["target_norm"] = y
 
-    feature_cols = list(X.columns)
     train = full.iloc[:N_TRAIN]
     test = full.iloc[N_TRAIN:]
 
@@ -152,7 +200,10 @@ def build_dataset(df, max_lag, vol_window, gauss_sigma, gauss_window, norm_mode)
         "y_test": test["target_norm"].to_numpy(),
         "train_time": train["time"].reset_index(drop=True),
         "test_time": test["time"].reset_index(drop=True),
+        "X_edge": edge[feature_cols].reset_index(drop=True),
+        "edge_time": edge["time"].reset_index(drop=True),
         "n_features": len(feature_cols),
+        "teacher_mode": teacher_mode,
     }
 
 # ---------------------------------------------------------------------------
@@ -196,6 +247,19 @@ with st.sidebar:
         st.rerun()
 
     st.header("Признаки и цель")
+    teacher_mode = st.selectbox(
+        "Учитель (целевая ПП)",
+        ["каузальный", "неказуальный"],
+        index=0,
+        help=(
+            "Каузальный: фильтр использует только текущий и прошлые бары — "
+            "сигнал доступен в реальном времени. "
+            "Неказуальный: симметричный фильтр использует и будущие бары — "
+            "«идеальный» учитель, недоступный в реальном времени. "
+            "На последних window//2 барах («край») учитель не вычислим, "
+            "но обученная модель выдаёт там его оценку по каузальным фичам."
+        ),
+    )
     max_lag = st.slider("max_lag — макс. лаг", 1, 50, 10)
     vol_window = st.slider("Окно волатильности", 5, 120, 20)
     gauss_sigma = st.slider("Gaussian sigma", 0.5, 10.0, 2.0, 0.5)
@@ -237,7 +301,7 @@ except Exception as exc:
     st.stop()
 
 # --- построение датасета
-dataset = build_dataset(raw, max_lag, vol_window, gauss_sigma, gauss_window, norm_mode)
+dataset = build_dataset(raw, max_lag, vol_window, gauss_sigma, gauss_window, norm_mode, teacher_mode)
 if dataset is None:
     st.error(
         "Недостаточно истории для выбранных окон/лагов. "
@@ -245,10 +309,21 @@ if dataset is None:
     )
     st.stop()
 
+has_edge = len(dataset["X_edge"]) > 0
+
+if teacher_mode == "неказуальный":
+    st.info(
+        f"Неказуальный учитель: целевая ПП использует будущие бары (look-ahead только в цели — "
+        f"это учитель, а не торговый сигнал). Последние {len(dataset['edge_time'])} баров истории — "
+        f"«край»: там истинная ПП ещё не вычислима, но обученная модель по каузальным фичам "
+        f"выдаёт её оценку в реальном времени (зелёная линия на графике)."
+    )
+
 # --- обучение и аппроксимация (индикатор загрузки)
 with st.spinner("Обучение LightGBM и аппроксимация ПП..."):
     model = train_model(dataset["X_train"], dataset["y_train"], lgbm_params)
     y_pred = model.predict(dataset["X_test"])
+    y_edge = model.predict(dataset["X_edge"]) if has_edge else None
 
 # --- метрики на тесте
 mae = mean_absolute_error(dataset["y_test"], y_pred)
@@ -261,26 +336,43 @@ c2.metric("RMSE (test)", f"{rmse:.5f}")
 c3.metric("R² (test)", f"{r2:.4f}")
 c4.metric("Признаков", dataset["n_features"])
 
+edge_note = f" | Край (оценка модели): {len(dataset['edge_time'])} баров" if has_edge else ""
 st.caption(
-    f"Источник: {source} | "
+    f"Источник: {source} | Учитель: {teacher_mode} | "
     f"Train: {dataset['train_time'].iloc[0]} — {dataset['train_time'].iloc[-1]} ({N_TRAIN} баров) | "
     f"Test: {dataset['test_time'].iloc[0]} — {dataset['test_time'].iloc[-1]} ({N_TEST} баров) | "
-    f"Нормализация: {norm_mode} (по train)"
+    f"Нормализация: {norm_mode} (по train){edge_note}"
 )
 
-# --- график (только тестовый сегмент)
+# --- график (тестовый сегмент + «край» с оценкой модели)
 fig = go.Figure()
 fig.add_trace(go.Scatter(
     x=dataset["test_time"], y=dataset["y_test"],
-    name="ПП (истина)", line=dict(color="#1f77b4", width=2),
+    name=f"ПП (истина, {teacher_mode} учитель)", line=dict(color="#1f77b4", width=2),
 ))
 fig.add_trace(go.Scatter(
     x=dataset["test_time"], y=y_pred,
     name="Аппроксимация LightGBM", line=dict(color="#ff7f0e", width=2, dash="dash"),
 ))
+if has_edge:
+    # непрерывно продолжаем линию от последней точки теста
+    edge_x = pd.concat([dataset["test_time"].iloc[-1:], dataset["edge_time"]], ignore_index=True)
+    edge_y = np.concatenate([[y_pred[-1]], y_edge])
+    fig.add_trace(go.Scatter(
+        x=edge_x, y=edge_y,
+        name="Оценка модели на краю (учитель недоступен)",
+        mode="lines+markers",
+        line=dict(color="#2ca02c", width=2, dash="dot"),
+        marker=dict(size=5),
+    ))
+    fig.add_vline(
+        x=dataset["edge_time"].iloc[0], line_dash="dot", line_color="#2ca02c",
+        annotation_text="край: дальше учитель недоступен",
+        annotation_position="top left",
+    )
 fig.add_hline(y=0, line_dash="dot", line_color="gray")
 fig.update_layout(
-    title="Тестовый сегмент (150 баров): истинная ПП vs аппроксимация",
+    title=f"Тестовый сегмент (150 баров): истинная ПП ({teacher_mode} учитель) vs аппроксимация",
     xaxis_title="Время",
     yaxis_title="ПП (норм.)",
     hovermode="x unified",
@@ -310,9 +402,19 @@ with st.expander("Экспорт обученной модели"):
 with st.expander("Методология (защита от look-ahead)"):
     st.markdown(
         """
-- **Гауссов фильтр** — односторонний (каузальный): веса только на текущий и прошлые бары.
-  Классический симметричный `gaussian_filter1d` заглядывал бы в будущее.
-- **Признаки** — только лаги `lag >= 1`: Close, Returns, Volatility.
+- **Два режима учителя (целевой ПП)**:
+  - *Каузальный* — односторонний гауссов фильтр: веса только на текущий и прошлые бары.
+    Сигнал доступен в реальном времени.
+  - *Неказуальный* — симметричный гауссов фильтр: использует и будущие бары.
+    Это «идеальный» учитель, недоступный в реальном времени; look-ahead есть
+    **только в цели**, что допустимо для исследования (модель учится
+    восстанавливать идеальный сигнал из прошлого).
+- **«Край» истории (неказуальный режим)**: на последних `window//2` барах истинная
+  неказуальная ПП ещё не вычислима (нужны будущие бары). Но обученная модель
+  получает на вход каузальные лаговые фичи и выдаёт **оценку идеальной ПП
+  в реальном времени** — именно этому она и обучалась. Эти бары показаны
+  на графике зелёной пунктирной линией; ground truth там нет по определению.
+- **Признаки** — только лаги `lag >= 1`: Close, Returns, Volatility (в обоих режимах).
 - **Нормализация ПП** — среднее/σ (или min/max) считаются только по train-сегменту.
 - **Сплит по времени**: train 1000 баров → test 150 баров строго позже.
 - **Воспроизводимость**: фиксированный seed, `deterministic=True`, `n_jobs=1`.
