@@ -1,6 +1,6 @@
 """
-Интерактивный аппроксиматор LightGBM (MT5, EURUSD M60) — V2
-============================================================
+Интерактивный аппроксиматор LightGBM (MT5, EURUSD M60)
+=======================================================
 
 Исследовательский инструмент (НЕ торговый бот):
 LightGBM НЕ прогнозирует цену, а учится аппроксимировать производный сигнал:
@@ -31,18 +31,9 @@ LightGBM НЕ прогнозирует цену, а учится аппрокс�
    * predict() вызывается СТРОГО по одному бару в цикле
      (НЕ на всей матрице сразу) — имитация реального времени.
 
-5. Бэктест (эквити на сегменте инференса):
-   * pred > 0 -> LONG, pred < 0 -> SHORT (pred == 0 -> пропуск бара).
-   * Вход по Close(t): признаки сигнала известны к закрытию бара t-1,
-     поэтому сделка по Close(t) не заглядывает в будущее.
-   * Позиция удерживается NB баров (слайдер), выход по Close(t+NB).
-   * Одна позиция за раз: сигналы во время открытой позиции игнорируются.
-   * Эквити — компаунд с 1.0, mark-to-market внутри сделки.
-   * Комиссии и проскальзывание не учитываются.
-
 Запуск:
     pip install -r requirements.txt
-    streamlit run lgbm_pp_approximator_V2.py
+    streamlit run lgbm_pp_approximator_V1.py
 
 Режим MT5 требует: Windows + запущенный терминал MetaTrader 5.
 Без MT5 доступен демо-режим на синтетических данных.
@@ -73,7 +64,7 @@ SEED = 42
 BARS_TRAIN = 1000   # обучающий сегмент (баров)
 BARS_TEST = 150     # тестовый сегмент (баров, строго после train)
 FETCH_BARS = 3000   # сколько баров запрашиваем (запас на прогрев признаков)
-SYMBOL = "GBPUSD"
+SYMBOL = "EURUSD"
 
 np.random.seed(SEED)
 
@@ -129,8 +120,7 @@ def build_dataset(df, max_lag, vol_window, gauss_sigma, gauss_truncate, norm_mod
 
     Признаки — только каузальные лаги (lag >= 1). Цель — неказуальная
     гауссова производная (scipy, mode='reflect'), посчитанная один раз
-    на всём датасете. Дополнительно возвращает Close тестового сегмента
-    (нужен для бэктеста; в признаки НЕ входит).
+    на всём датасете.
 
     Возвращает dict с train/test или None, если истории не хватает.
     """
@@ -152,7 +142,7 @@ def build_dataset(df, max_lag, vol_window, gauss_sigma, gauss_truncate, norm_mod
     X = pd.DataFrame(feats, index=df.index)
     feature_cols = list(X.columns)
 
-    full = pd.concat([df["time"], df["close"], X, target_raw.rename("target")], axis=1)
+    full = pd.concat([df["time"], X, target_raw.rename("target")], axis=1)
     full = full.dropna().reset_index(drop=True)
 
     if len(full) < BARS_TRAIN + BARS_TEST:
@@ -182,7 +172,6 @@ def build_dataset(df, max_lag, vol_window, gauss_sigma, gauss_truncate, norm_mod
         "y_train": train["target_norm"].to_numpy(),
         "X_test": test[feature_cols],
         "y_test": test["target_norm"].to_numpy(),
-        "test_close": test["close"].to_numpy(dtype=float),
         "train_time": train["time"].reset_index(drop=True),
         "test_time": test["time"].reset_index(drop=True),
         "n_features": len(feature_cols),
@@ -219,75 +208,17 @@ def rolling_predict(model, X_test) -> np.ndarray:
     return preds
 
 # ---------------------------------------------------------------------------
-# Бэктест (эквити на сегменте инференса)
-# ---------------------------------------------------------------------------
-def backtest_signals(close: np.ndarray, preds: np.ndarray, hold_bars: int):
-    """Event-driven бэктест по знаку прогноза (без пирамидинга).
-
-    Правила:
-      * сигнал на баре t: pred > 0 -> LONG, pred < 0 -> SHORT (0 -> пропуск);
-      * вход по Close(t) — признаки сигнала известны к закрытию бара t-1,
-        поэтому сделка по Close(t) не заглядывает в будущее;
-      * позиция удерживается ровно hold_bars баров, выход по Close(t+hold_bars)
-        (если история кончается раньше — по Close последнего бара);
-      * пока позиция открыта, новые сигналы игнорируются; следующий сигнал
-        рассматривается со следующего бара после выхода;
-      * доходность сделки: direction * (exit - entry) / entry;
-      * эквити — компаунд: equity *= (1 + ret), старт с 1.0; внутри сделки
-        эквити переоценивается по рынку (mark-to-market).
-
-    Возвращает (equity_curve, trades).
-    """
-    n = len(close)
-    equity = np.ones(n)
-    trades = []
-    eq = 1.0
-    i = 0
-    while i < n:
-        if i >= n - 1:  # последний бар: сделку не открываем, эквити фиксируем
-            equity[i] = eq
-            i += 1
-            continue
-        p = preds[i]
-        if p > 0:
-            direction = 1
-        elif p < 0:
-            direction = -1
-        else:
-            equity[i] = eq
-            i += 1
-            continue
-        entry = float(close[i])
-        exit_idx = min(i + hold_bars, n - 1)
-        for k in range(i, exit_idx + 1):  # mark-to-market внутри сделки
-            equity[k] = eq * (1.0 + direction * (float(close[k]) - entry) / entry)
-        exit_price = float(close[exit_idx])
-        ret = direction * (exit_price - entry) / entry
-        eq *= 1.0 + ret
-        trades.append({
-            "entry_idx": i,
-            "exit_idx": exit_idx,
-            "direction": direction,
-            "entry": entry,
-            "exit": exit_price,
-            "ret": ret,
-        })
-        i = exit_idx + 1
-    return equity, trades
-
-# ---------------------------------------------------------------------------
 # Интерфейс
 # ---------------------------------------------------------------------------
-st.set_page_config(page_title="LightGBM ПП-аппроксиматор V2", layout="wide")
+st.set_page_config(page_title="LightGBM ПП-аппроксиматор", layout="wide")
 
-st.title("LightGBM-аппроксимация ПП + эквити-бэктест (V2)")
+st.title("LightGBM-аппроксимация ПП (неказуальная гауссова производная Close)")
 st.caption(
     "Исследовательский инструмент, НЕ торговый бот. "
     "Модель не прогнозирует цену: она аппроксимирует «идеальную» неказуальную "
     "производную сглаженного ряда по каузальным лаговым признакам. "
     "Инференс — строгий покадровый цикл на тестовом сегменте "
-    "(150 баров сразу после обучающих 1000). По знаку прогноза строится "
-    "эквити: pred > 0 — LONG, pred < 0 — SHORT, удержание NB баров."
+    "(150 баров сразу после обучающих 1000)."
 )
 
 with st.sidebar:
@@ -321,13 +252,6 @@ with st.sidebar:
     bagging_fraction = st.slider("bagging_fraction", 0.3, 1.0, 0.8, 0.05)
     lambda_l1 = st.slider("lambda_l1", 0.0, 10.0, 0.0, 0.1)
     lambda_l2 = st.slider("lambda_l2", 0.0, 10.0, 0.0, 0.1)
-
-    st.header("Бэктест (эквити)")
-    hold_bars = st.slider(
-        "NB — удержание позиции (баров)", 1, 20, 2,
-        help="Позиция открывается по Close(t) и закрывается по Close(t+NB). "
-             "Одна позиция за раз: сигналы во время открытой позиции игнорируются.",
-    )
 
 lgbm_params = dict(
     num_leaves=num_leaves,
@@ -365,9 +289,7 @@ st.info(
     "Учитель — неказуальная гауссова производная (scipy, mode='reflect'): "
     "симметричное ядро видит будущие бары — это «идеальный» сигнал, а не "
     "торговый сигнал. Признаки — строго каузальные лаги; инференс — строгий "
-    "покадровый цикл predict() по одному бару, как в реальном времени. "
-    "Эквити ниже — результат простого бэктеста по знаку прогноза "
-    "(без комиссий и проскальзывания)."
+    "покадровый цикл predict() по одному бару, как в реальном времени."
 )
 
 # --- обучение и строгий покадровый прогноз (индикатор загрузки)
@@ -375,7 +297,7 @@ with st.spinner("Обучение LightGBM и строгий покадровы�
     model = train_model(dataset["X_train"], dataset["y_train"], lgbm_params)
     y_pred = rolling_predict(model, dataset["X_test"])
 
-# --- метрики аппроксимации на тесте
+# --- метрики на тесте
 mae = mean_absolute_error(dataset["y_test"], y_pred)
 rmse = float(np.sqrt(mean_squared_error(dataset["y_test"], y_pred)))
 r2 = r2_score(dataset["y_test"], y_pred)
@@ -416,80 +338,13 @@ fig.update_layout(
 )
 st.plotly_chart(fig, use_container_width=True)
 
-# --- бэктест: эквити по знаку прогноза на сегменте инференса
-equity, trades = backtest_signals(dataset["test_close"], y_pred, hold_bars)
-
-n_trades = len(trades)
-win_rate = float(np.mean([t["ret"] > 0 for t in trades])) if trades else 0.0
-running_max = np.maximum.accumulate(equity)
-max_dd = float((equity / running_max - 1.0).min())
-total_ret = float(equity[-1] - 1.0)
-
-st.subheader("Эквити на сегменте инференса (бэктест по знаку прогноза)")
-
-b1, b2, b3, b4 = st.columns(4)
-b1.metric("Доходность (эквити)", f"{total_ret * 100:.2f}%")
-b2.metric("Сделок", n_trades)
-b3.metric("Win rate", f"{win_rate * 100:.1f}%")
-b4.metric("Макс. просадка", f"{max_dd * 100:.2f}%")
-
-st.caption(
-    f"Правила: pred > 0 → LONG, pred < 0 → SHORT | вход по Close(t), "
-    f"выход по Close(t+{hold_bars}) | одна позиция за раз | "
-    f"компаунд с 1.0 | без комиссий и проскальзывания"
-)
-
-fig_eq = go.Figure()
-fig_eq.add_trace(go.Scatter(
-    x=dataset["test_time"], y=equity,
-    name="Эквити (компаунд, старт = 1.0)",
-    line=dict(color="#2ca02c", width=2),
-))
-if trades:
-    exit_idx = [t["exit_idx"] for t in trades]
-    exit_colors = ["#2ca02c" if t["ret"] > 0 else "#d62728" for t in trades]
-    exit_text = [
-        f"{'LONG' if t['direction'] > 0 else 'SHORT'}: {t['ret'] * 100:+.3f}%"
-        for t in trades
-    ]
-    fig_eq.add_trace(go.Scatter(
-        x=dataset["test_time"].iloc[exit_idx], y=equity[exit_idx],
-        mode="markers", name="Закрытия сделок",
-        marker=dict(color=exit_colors, size=8, symbol="circle"),
-        text=exit_text, hovertemplate="%{x}<br>%{text}<br>Эквити: %{y:.4f}<extra></extra>",
-    ))
-fig_eq.add_hline(y=1.0, line_dash="dot", line_color="gray")
-fig_eq.update_layout(
-    title=f"Эквити (тестовый сегмент, NB = {hold_bars} бара удержания)",
-    xaxis_title="Время",
-    yaxis_title="Эквити",
-    hovermode="x unified",
-    height=420,
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-)
-st.plotly_chart(fig_eq, use_container_width=True)
-
-with st.expander("Журнал сделок (тестовый сегмент)"):
-    if trades:
-        trades_df = pd.DataFrame({
-            "Вход (время)": [dataset["test_time"].iloc[t["entry_idx"]] for t in trades],
-            "Выход (время)": [dataset["test_time"].iloc[t["exit_idx"]] for t in trades],
-            "Направление": ["LONG" if t["direction"] > 0 else "SHORT" for t in trades],
-            "Цена входа": [t["entry"] for t in trades],
-            "Цена выхода": [t["exit"] for t in trades],
-            "Доходность, %": [t["ret"] * 100 for t in trades],
-        })
-        st.dataframe(trades_df, use_container_width=True)
-    else:
-        st.write("Сделок не было (все прогнозы нулевые или сегмент слишком короткий).")
-
 # --- экспорт обученной модели
 with st.expander("Экспорт обученной модели"):
     e1, e2 = st.columns(2)
     e1.download_button(
         "Скачать booster (.txt)",
         data=model.booster_.model_to_string(),
-        file_name="lgbm_pp_approximator_V2.txt",
+        file_name="lgbm_pp_approximator_V1.txt",
         mime="text/plain",
     )
     buf = io.BytesIO()
@@ -497,7 +352,7 @@ with st.expander("Экспорт обученной модели"):
     e2.download_button(
         "Скачать модель (.pkl)",
         data=buf.getvalue(),
-        file_name="lgbm_pp_approximator_V2.pkl",
+        file_name="lgbm_pp_approximator_V1.pkl",
         mime="application/octet-stream",
     )
 
@@ -519,14 +374,6 @@ with st.expander("Методология (защита от look-ahead)"):
   сразу. На шаге `t` модель получает только `[t-1 ... t-LAGS]` — имитация
   реального времени. Первый предсказанный бар исходного ряда:
   `BARS_TRAIN + LAGS` (первые бары уходят на прогрев лагов).
-- **Бэктест (эквити)** — на сегменте инференса: `pred > 0` → LONG,
-  `pred < 0` → SHORT; вход по `Close(t)` (сигнал известен к закрытию бара
-  `t-1` — без look-ahead), удержание `NB` баров, выход по `Close(t+NB)`;
-  одна позиция за раз (сигналы во время открытой позиции игнорируются);
-  доходность сделки `direction * (exit - entry) / entry`; эквити — компаунд
-  с 1.0, mark-to-market внутри сделки; комиссии и проскальзывание не
-  учитываются. Знак прогноза инвариантен к режиму нормализации ПП
-  (z-score/min-max — монотонные преобразования).
 - **Нормализация ПП** — среднее/σ (или min/max) считаются только по train-сегменту.
 - **Сплит по времени**: train 1000 баров → test 150 баров строго позже.
 - **Воспроизводимость**: фиксированный seed, `deterministic=True`, `n_jobs=1`.

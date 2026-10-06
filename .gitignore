@@ -1,0 +1,6 @@
+.aider*
+__pycache__/
+*.py[oc]
+KIMIAPI.py
+Start_Aider_with_KIMI-3.bat
+API/API.txt
